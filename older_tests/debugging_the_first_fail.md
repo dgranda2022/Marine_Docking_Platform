@@ -1,0 +1,1 @@
+Right now I can move the motor (feb 11, 2025) and plot the commands that I send from my computer. I want to way to track what the motor is actually doing with its position. 

@@ -61,7 +61,10 @@ class RealTimePlotter:
         pos_int = int(position_deg * 1000000.0)
         data = struct.pack('>i', pos_int)
         msg = can.Message(arbitration_id=cmd_id, data=data, is_extended_id=True)
-        self.bus.send(msg)
+        try:
+            self.bus.send(msg)
+        except can.CanError:
+            print("Warning: CAN Buffer Full - Motor not responding?", end='\r')
 
     def run(self):
         print("Starting Dashboard...")
