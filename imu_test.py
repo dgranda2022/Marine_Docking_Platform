@@ -2,6 +2,8 @@ import time
 import math
 import board
 import busio
+import csv
+import datetime
 from adafruit_bno08x import (
     BNO_REPORT_ROTATION_VECTOR,
 )
@@ -37,42 +39,58 @@ def main():
         return
 
     print("IMU Active! Move the sensor...")
+    
+    # Create a log file with a timestamp
+    log_filename = f"imu_log_{datetime.datetime.now().strftime('%H%M%S')}.csv"
+    print(f"Logging data to: {log_filename}")
+    
     print("--------------------------------------")
 
-    while True:
-        try:
-            # --- THE DANGER ZONE ---
-            # This is where the read usually fails
-            quat = bno.quaternion
-            
-            if quat:
-                # Unpack tuple (i, j, k, real)
-                roll, pitch, yaw = quaternion_to_euler(quat[0], quat[1], quat[2], quat[3])
+    with open(log_filename, mode='w', newline='') as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["Time", "Roll", "Pitch", "Yaw"])
+        
+        start_time = time.time()
+
+        while True:
+            try:
+                # --- THE DANGER ZONE ---
+                # This is where the read usually fails
+                quat = bno.quaternion
                 
-                # Print nicely formatted
-                print(f"Roll: {roll:6.2f}°  |  Pitch: {pitch:6.2f}°  |  Yaw: {yaw:6.2f}°", end='\r')
-            
-        except OSError as e:
-            # Check for "Remote I/O Error" (121)
-            if e.errno == 121:
-                # Just skip this frame and try again immediately
-                continue
-            else:
-                # If it's a different error, print it but keep going
-                print(f"\nBus Error: {e}")
+                if quat:
+                    # Unpack tuple (i, j, k, real)
+                    roll, pitch, yaw = quaternion_to_euler(quat[0], quat[1], quat[2], quat[3])
+                    
+                    # Log to CSV
+                    elapsed = time.time() - start_time
+                    writer.writerow([elapsed, roll, pitch, yaw])
+                    
+                    # Print nicely formatted
+                    print(f"[{elapsed:5.1f}s] Roll: {roll:6.2f}°  |  Pitch: {pitch:6.2f}°  |  Yaw: {yaw:6.2f}°", end='\r')
+                
+            except OSError as e:
+                # Check for "Remote I/O Error" (121)
+                if e.errno == 121:
+                    # Just skip this frame and try again immediately
+                    continue
+                else:
+                    # If it's a different error, print it but keep going
+                    print(f"\nBus Error: {e}")
+                    time.sleep(0.1)
+                    
+            except RuntimeError as e:
+                # BNO085 sometimes throws RuntimeErrors if it gets confused
+                print(f"\nSensor Sync Error, resetting... {e}")
                 time.sleep(0.1)
                 
-        except RuntimeError as e:
-            # BNO085 sometimes throws RuntimeErrors if it gets confused
-            print(f"\nSensor Sync Error, resetting... {e}")
-            time.sleep(0.1)
-            
-        except KeyboardInterrupt:
-            print("\nStopping...")
-            break
+            except KeyboardInterrupt:
+                print(f"\nSaved log to {log_filename}")
+                print("Stopping...")
+                break
 
-        # Small delay to let the bus breathe
-        time.sleep(0.01)
+            # Small delay to let the bus breathe
+            time.sleep(0.01)
 
 if __name__ == "__main__":
     main()
