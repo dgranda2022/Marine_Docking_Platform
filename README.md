@@ -1,4 +1,3 @@
-```markdown
 # Marine Docking Platform - Engineering Design 2 (ED2)
 
 **Project:** Active Stabilization System for Marine Docking  
@@ -112,7 +111,5 @@ There are several older scripts in this repository, but **only the scripts liste
 ### Next Steps / Capstone Goals:
 
 You can use `motor_driver.py` and `imu_test.py` as your building blocks. Make sure you understand how to individually read the IMU and individually command the motor before attempting to merge them into a closed-loop PID controller.
-
-```
 
 ```
