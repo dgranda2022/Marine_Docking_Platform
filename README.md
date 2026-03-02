@@ -1,333 +1,168 @@
+# feature/modular-pd-arch
 
-# Active Stabilization System - Integration & Setup Guide
+## Marine Docking Platform — Modular PD Control Architecture
 
-**Project:** Mechanical Engineering Capstone II  
-**Role:** Controls & Software  
-**Date:** February 2026
+This branch replaces the previous single-script test approach with a modular, contract-based Hardware Abstraction Layer (HAL) architecture for the Jetson Orin Nano stabilization system. Each module owns exactly one responsibility and communicates through a centralized State Dictionary managed by a single orchestrator loop.
 
----
-
-## 1. System Architecture (The "Workaround")
-Due to USB-to-CAN driver incompatibility on the Jetson Orin Nano, the system uses a **Network Bridge Architecture**:
-
-* **Brain (Jetson Orin Nano):** Reads IMU (I2C) $\rightarrow$ Calculates Control Signal $\rightarrow$ Sends UDP Packet.
-* **Bridge (Laptop/Ground Station):** Listens for UDP $\rightarrow$ Graphic Visualization $\rightarrow$ Writes to CAN Bus $\rightarrow$ Motor.
+If you are pulling this branch for the first time, read the full setup procedure below before powering on the motors.
 
 ---
 
-## 2. Hardware "Golden" Configuration
-**WARNING:** These values are hard-coded in the scripts. Do not change without updating code.
+## Software Architecture
 
-| Component | Setting | Value | Notes |
-| :--- | :--- | :--- | :--- |
-| **Motor** | Hardware ID | `1` | CubeMars AK60-39 |
-| **Motor** | CAN Command ID | `4` | **Critical:** ID 4 is "Set Position". ID 16 will fail. |
-| **IMU** | Model | BNO085 | Adafruit Breakout |
-| **IMU** | Interface | I2C | Address `0x4A` (default) or `0x4B` |
-| **Network**| Jetson IP | `192.168.55.1` | USB Device Mode IP |
-| **Network**| Laptop IP | `192.168.55.100` | USB Host IP |
+The codebase is organized around a strict principle: **separation of concerns**. No module knows how any other module works internally. They exchange data exclusively through a centralized, JSON-style State Dictionary that the orchestrator reads and writes on every loop iteration.
+
+There are four files, each with a single job.
+
+### `main.py` — The Orchestrator
+
+This is the only file that imports the other three. It runs a **50 Hz control loop** (`dt = 0.02s`) and is responsible for the following:
+
+- Initializing all hardware (IMU, both motors) and verifying connections at startup.
+- Computing a precise time delta (`dt`) on every iteration using `time.perf_counter()`. This compensates for Linux OS scheduling jitter, which on a non-RT kernel can cause individual loop periods to drift by several milliseconds.
+- Reading sensor data, passing it to the controllers, sending commands to the motors, reading motor feedback, and updating the State Dictionary — in that exact order, every cycle.
+- Printing a single overwriting status line to the terminal for real-time monitoring.
+- Catching `KeyboardInterrupt` and guaranteeing that both motors receive a zero-torque command and the CAN bus is released in the `finally` block.
+
+The orchestrator does not contain any math, any byte packing, or any I2C transactions. It only moves data between modules.
+
+### `pd_controller.py` — Module A (Pure Math)
+
+A stateless-except-for-derivative PD controller class. It accepts a target angle, a measured angle, and a `dt`, then returns a clamped torque command.
+
+Key characteristics:
+
+- **State retention**: The class stores `previous_error` internally so it can compute the derivative term `(error - previous_error) / dt` across consecutive calls.
+- **Safety clamping**: The output is hard-limited to `±max_torque` (default 3.0 Amps). This is the last line of defense before current hits the motors.
+- **Zero-dt guard**: If `dt` is zero or negative (which can happen on the first iteration or under extreme scheduling anomalies), the derivative term is suppressed entirely rather than producing a division-by-zero fault.
+- **No hardware imports**: This file imports nothing beyond Python builtins. It can be unit-tested on any laptop without a Jetson.
+
+### `motor_driver.py` — Module B (CAN Bus HAL)
+
+The SocketCAN interface to the CubeMars actuators. Each instance manages one motor.
+
+Key characteristics:
+
+- **Byte-level protocol**: Torque commands are scaled to milliamps and packed as 32-bit big-endian signed integers (`>i`). Feedback frames carry four signed 16-bit integers (`>hhhh`) encoding position, velocity, current, and temperature.
+- **Buffer draining**: The `get_state()` method uses a `while True` loop with `recv(timeout=0)` to aggressively drain the Linux kernel's CAN receive buffer. This ensures the returned feedback is always the most recent frame, not a stale one sitting in the queue. Without this pattern, feedback latency accumulates and the control loop operates on outdated data.
+- **Arming sequence**: CubeMars motors require a wake-up handshake — ten consecutive zero-current commands at 10 ms intervals — before they accept real torque commands.
+- **Graceful error handling**: `can.CanError` exceptions on send (typically caused by a full transmit buffer) are caught and suppressed so a single dropped frame does not crash the loop.
+
+> **⚠️ Critical Note:** CubeMars motors require **Extended CAN Frames** (`is_extended_id=True`). Verify this flag is set correctly in `motor_driver.py` before running on hardware. Sending standard frames to a CubeMars controller will be silently ignored.
+
+### `imu_sensor.py` — Module C (I2C HAL)
+
+The interface to the BNO085 9-axis IMU over the Jetson's I2C bus.
+
+Key characteristics:
+
+- **Hardware Kalman filter**: The driver enables `BNO_REPORT_ROTATION_VECTOR`, which activates the BNO085's onboard sensor-fusion engine. This gives us drift-corrected quaternion orientation without running our own filter.
+- **Quaternion-to-Euler conversion**: The raw quaternion `(i, j, k, real)` is converted to Roll, Pitch, and Yaw in degrees using the standard ZYX aerospace convention. The pitch calculation includes a clamp to `[-1, 1]` before `asin` to prevent `NaN` near gimbal lock.
+- **I2C fault tolerance**: Every sensor read is wrapped in a `try/except` block. If the I2C bus returns garbage (common with long wire runs, electrical noise from motors, or marginal pull-up resistor values), the class returns the last known good reading rather than crashing or returning zeros.
 
 ---
 
-## 3. Software Dependencies
-If setting up a new machine, install these first.
+## Hardware Setup
 
-**On the Jetson:**
+### Connecting to the Jetson via USB-C
+
+Plug a USB-C cable into the Jetson Orin Nano's **data** USB-C port (not the power barrel jack). The Jetson exposes a static IP over USB networking.
+
 ```bash
-sudo apt-get install i2c-tools
-pip3 install adafruit-circuitpython-bno08x board busio
-
+ssh edg5@192.168.55.1
 ```
 
-**On the Laptop:**
+**Windows users:** Use WSL (Windows Subsystem for Linux) for SSH. The native Windows OpenSSH client has known routing bugs with USB-gadget network interfaces that cause intermittent connection drops.
 
-```bash
-pip3 install python-can matplotlib
+### Sharing Internet to the Jetson
 
-```
+The Jetson needs internet access to install Python packages and system updates. You must forward your laptop's Wi-Fi connection over the USB link.
 
----
+**On your laptop (Linux):**
 
-## 4. Operations Manual (Start Here)
-
-### Step 1: Internet Sharing (Run on Laptop)
-
-*Why:* The Jetson cannot access the internet or install packages without this. Run this every time you reboot or switch Wi-Fi networks.
-
-1. Enable IP Forwarding
+First, enable IP forwarding:
 
 ```bash
 sudo sysctl -w net.ipv4.ip_forward=1
 ```
 
-2. Identify your current Internet Source (Auto-detects Wifi/Ethernet)
+Identify your Wi-Fi interface name (commonly `wlan0` or `wlp2s0`):
 
 ```bash
-WIFI_IF=$(ip route | grep default | awk '{print $5}' | head -n 1)
-echo "Sharing Internet from Interface: $WIFI_IF"
+ip route | grep default
 ```
 
-3. Setup NAT (The "Masquerade")
+Set up NAT masquerading, replacing `<WIFI_INTERFACE>` with your interface name:
 
 ```bash
-sudo iptables -t nat -A POSTROUTING -s 192.168.55.0/24 -o $WIFI_IF -j MASQUERADE
-sudo iptables -A FORWARD -s 192.168.55.0/24 -o $WIFI_IF -j ACCEPT
-sudo iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
+sudo iptables -t nat -A POSTROUTING -o <WIFI_INTERFACE> -j MASQUERADE
+sudo iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+sudo iptables -A FORWARD -s 192.168.55.0/24 -j ACCEPT
 ```
 
-### Step 2: Establish Route (Run on Jetson)
-
-*Why:* The Jetson knows it is connected to the laptop, but doesn't know the laptop is its gateway to the internet.
+**On the Jetson:**
 
 ```bash
-# 1. Set the Laptop (192.168.55.100) as the Gateway
 sudo route add default gw 192.168.55.100
-
-# 2. Set Google DNS (Temporary)
 echo "nameserver 8.8.8.8" | sudo tee /etc/resolv.conf > /dev/null
-
-# 3. Test Connection
-ping -c 3 google.com
-
 ```
 
----
+Verify connectivity with `ping 8.8.8.8`. If it works but `ping google.com` does not, the DNS line did not stick — re-run the `tee` command.
 
-## 5. Hardware Interface Setup
+### Setting Up the CAN Bus (J17 Header)
 
-### A. IMU Setup (Jetson Side)
+The Waveshare SN65HVD230 CAN transceiver is wired to the Jetson's **J17 expansion header**. The four connections are TX, RX, 3.3V, and GND. Refer to the Jetson Orin Nano pinout sheet for exact pin numbers.
 
-*The Bus Hunt:* On the Jetson Orin Nano, the I2C pins (Pins 3 & 5) are not always Bus 1.
+**Load the kernel modules:**
 
-1. Run discovery:
 ```bash
-sudo i2cdetect -y -r 1
-sudo i2cdetect -y -r 7
-sudo i2cdetect -y -r 8
-
+sudo modprobe can
+sudo modprobe can_raw
+sudo modprobe mttcan
 ```
 
+**Bring up the interface at 1 Mbit/s:**
 
-2. Look for `4a` or `4b` in the grid. Update the Python script `board.SCL_1` vs `board.SCL` accordingly.
-
-### B. Motor Setup (Laptop Side)
-
-1. **Bring up CAN Interface:**
 ```bash
-sudo ip link set can0 up type can bitrate 1000000
-
+sudo ip link set can0 type can bitrate 1000000 restart-ms 100
+sudo ip link set can0 txqueuelen 1000 up
 ```
 
+The `restart-ms 100` parameter tells the driver to automatically recover from bus-off errors after 100 ms. The `txqueuelen 1000` value prevents transmit buffer overflows during sustained 50 Hz operation.
 
-2. **Verify Connection:**
+Verify the interface is active:
+
 ```bash
 ip link show can0
-# You should see "state UP"
-
 ```
 
-
+You should see `state UP` and `qlen 1000` in the output.
 
 ---
 
-## 6. Startup Sequence (The "Launch")
+## Hardware Parameter Map
 
-### 1. SSH into Jetson
-
-Connect the USB-C cable from Laptop to Jetson (Data Port).
-
-```bash
-ssh edg5@192.168.55.1
-# Password: Docking_station!
-
-```
-
-*(Note: Replace `<your_username>` with your actual user)*
-
-### 2. Start the Ground Station (Laptop)
-
-This must run first to listen for the Jetson.
-
-```bash
-python3 laptop_relay.py
-# Expected Output: "Listening on 5005..."
-
-```
-
-### 3. Start the Brain (Jetson)
-
-```bash
-python3 jetson_brain.py
-# Expected Output: "IMU Connected... Sending packets..."
-
-```
+| Parameter              | Value                                                                 |
+|------------------------|-----------------------------------------------------------------------|
+| Motor 1 (Roll Axis)    | CAN ID `104` — being migrated to ID `1` in the final build           |
+| Motor 2 (Pitch Axis)   | CAN ID `2`                                                           |
+| CAN Bitrate            | 1,000,000 bps (1 Mbit/s)                                             |
+| Control Loop Frequency | 50 Hz (20 ms period)                                                 |
+| Default Kp             | 0.1                                                                  |
+| Default Kd             | 0.01                                                                 |
+| Max Torque (Clamp)     | ±3.0 Amps                                                            |
+| IMU                    | BNO085 over I2C (`board.SCL` / `board.SDA`)                          |
+| CAN Transceiver        | Waveshare SN65HVD230 on J17 header                                   |
 
 ---
 
-## 7. Troubleshooting
+## Quick Start
 
-* **"OSError: [Errno 121] Remote I/O error" (Jetson):**
-* The IMU wiring is loose, or you are targeting the wrong I2C Bus. Re-run `i2cdetect`.
+After completing the hardware setup above:
 
-
-* **Motor doesn't move but Graph works:**
-* Check the **Motor ID** (Is it 1?).
-* Check the **CAN ID** (Is it 4?).
-* Ensure the battery is on (Voltage > 40V).
-
-
-* **"Network is unreachable" (Jetson):**
-* You forgot to run the **Step 1** (iptables) on laptop or **Step 2** (route) on Jetson.
-* Your Laptop's Wi-Fi interface name might have changed. Rerunning the auto-detect script fixes this.
-
-
-
----
-
-## Appendix: Reference Scripts
-
-### A. `motor_relay.py` (Fixed CAN ID)
-
-```python
-import socket
-import json
-import can
-import struct
-import matplotlib.pyplot as plt
-from collections import deque
-import time
-
-# --- CONFIGURATION ---
-UDP_IP = "0.0.0.0"
-UDP_PORT = 5005
-MOTOR_ID = 1
-CAN_PACKET_SET_POS = 4  # FIXED: Changed from 16 to 4
-
-# --- SETUP CAN ---
-try:
-    bus = can.interface.Bus(channel='can0', interface='socketcan')
-    print("[OK] Laptop CAN Interface Connected")
-except Exception as e:
-    print(f"[ERR] CAN Failed: {e}")
-    exit()
-
-# --- SETUP NETWORK ---
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind((UDP_IP, UDP_PORT))
-sock.setblocking(False)
-
-# --- GRAPHING SETUP ---
-plt.ion()
-fig, ax = plt.subplots(figsize=(10, 5))
-times = deque(maxlen=50)
-rolls = deque(maxlen=50)
-line, = ax.plot([], [], 'r-', linewidth=2, label="IMU Roll")
-ax.set_ylim(-60, 60)
-ax.set_title("Remote Balance Monitor")
-ax.grid(True)
-
-def send_vesc_cmd(position):
-    arbitration_id = (CAN_PACKET_SET_POS << 8) | MOTOR_ID
-    value = int(position * 1000000.0)
-    data = struct.pack(">i", value)
-    msg = can.Message(arbitration_id=arbitration_id, data=data, is_extended_id=True)
-    bus.send(msg)
-
-print(f"Listening on {UDP_PORT}...")
-packet_count = 0
-
-try:
-    while True:
-        try:
-            data, addr = sock.recvfrom(1024)
-            packet = json.loads(data.decode())
-            
-            # DRIVE MOTOR IMMEDIATELY
-            target = packet.get('motor', 0)
-            send_vesc_cmd(target)
-            
-            # UPDATE GRAPH (Decimated to avoid lag)
-            packet_count += 1
-            if packet_count % 10 == 0:
-                roll = packet.get('roll', 0)
-                rolls.append(roll)
-                line.set_data(range(len(rolls)), rolls)
-                ax.set_xlim(0, len(rolls))
-                plt.pause(0.001)
-                
-        except BlockingIOError:
-            pass
-        except Exception as e:
-            print(f"Error: {e}")
-
-except KeyboardInterrupt:
-    # Safety Stop
-    stop_id = (1 << 8) | MOTOR_ID
-    bus.send(can.Message(arbitration_id=stop_id, data=struct.pack('>i', 0), is_extended_id=True))
-    print("Motor released.")
-
+```bash
+cd ~/catamaran/feature-modular-pd-arch
+python3 main.py
 ```
-### B. `brain.py` (This is on jetson)
 
-```python
-import time
-import math
-import socket
-import json
-import board
-import busio
-from adafruit_bno08x import BNO_REPORT_ROTATION_VECTOR
-from adafruit_bno08x.i2c import BNO08X_I2C
-
-# --- CONFIGURATION ---
-LAPTOP_IP = "192.168.55.100"  # Target IP (Laptop)
-UDP_PORT = 5005
-SAFETY_LIMIT = 45.0
-
-# --- SETUP IMU ---
-try:
-    i2c = busio.I2C(board.SCL, board.SDA)
-    bno = BNO08X_I2C(i2c)
-    bno.enable_feature(BNO_REPORT_ROTATION_VECTOR)
-    print("[OK] IMU Connected")
-except Exception as e:
-    print(f"[ERR] IMU Failed: {e}")
-    exit()
-
-# --- NETWORK ---
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-def get_imu_roll():
-    try:
-        quat = bno.quaternion
-        if not quat: return None
-        sinr_cosp = 2 * (quat[3] * quat[0] + quat[1] * quat[2])
-        cosr_cosp = 1 - 2 * (quat[0] * quat[0] + quat[1] * quat[1])
-        roll = math.atan2(sinr_cosp, cosr_cosp)
-        return math.degrees(roll)
-    except:
-        return None
-
-print("--- JETSON BRAIN ACTIVE ---")
-print("Move the sensor to drive the Laptop's motor.")
-
-while True:
-    roll = get_imu_roll()
-    if roll is None: continue
-
-    # 1. Safety Logic
-    if abs(roll) > SAFETY_LIMIT:
-        motor_target = 0 # Kill
-    else:
-        # 2. The Logic: Mirror the angle
-        motor_target = -1.0 * roll
-
-    # 3. Send Command to Laptop
-    packet = {
-        "roll": round(roll, 2),
-        "motor": round(motor_target, 2)
-    }
-    sock.sendto(json.dumps(packet).encode(), (LAPTOP_IP, UDP_PORT))
-
-    time.sleep(0.01) # 100Hz
-```
+The terminal will display a single updating line showing real-time roll, pitch, commanded torques, and loop timing. Press `Ctrl+C` to stop. The shutdown handler will zero both motors and release the CAN bus automatically.
