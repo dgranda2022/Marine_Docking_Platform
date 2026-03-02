@@ -1,122 +1,126 @@
-import can
+"""CAN-based motor driver for CubeMars actuators over SocketCAN."""
+
 import struct
 import time
-import csv
-import datetime
+
+import can
+
 
 class MotorDriver:
-    def __init__(self, motor_id=104, interface='can0'):
-        self.motor_id = motor_id
-        self.interface = interface
-        self.bus = None
-        # Scaling from Manual V3.0.1
-        self.POS_SCALE = 0.1
-        self.VEL_SCALE = 10.0
-        self.CUR_SCALE = 0.01
-        
-    def connect(self):
+    """Low-level driver for a CubeMars motor on a SocketCAN interface.
+
+    Handles connection lifecycle, arming sequence, torque commands, and
+    state feedback parsing over a raw CAN bus.
+
+    Attributes:
+        motor_id: CAN device ID of the target motor.
+        interface: SocketCAN channel name (e.g., 'can0').
+        POS_SCALE: Multiplier to convert raw position ticks to user units.
+        CUR_SCALE: Multiplier to convert raw current ticks to amperes.
+        bus: The underlying python-can Bus instance, set by `connect()`.
+    """
+
+    POS_SCALE: float = 0.1
+    CUR_SCALE: float = 0.01
+
+    def __init__(self, motor_id: int = 1, interface: str = "can0") -> None:
+        """Initialize the motor driver.
+
+        Args:
+            motor_id: CAN node ID of the CubeMars motor (default 1).
+            interface: SocketCAN channel to use (default 'can0').
+        """
+        self.motor_id: int = motor_id
+        self.interface: str = interface
+        self.bus: can.Bus | None = None
+
+    def connect(self) -> bool:
+        """Open the SocketCAN bus at 1 Mbit/s.
+
+        Returns:
+            True if the bus was opened successfully, False otherwise.
+        """
         try:
-            self.bus = can.interface.Bus(channel=self.interface, bustype='socketcan', bitrate=1000000)
-            print(f"[Motor {self.motor_id}] Connected.")
+            self.bus = can.Bus(
+                interface="socketcan",
+                channel=self.interface,
+                bitrate=1000000,
+            )
             return True
-        except Exception as e:
-            print(f"[Motor {self.motor_id}] Connection Failed: {e}")
+        except (can.CanError, OSError):
+            self.bus = None
             return False
 
-    def arm(self):
-        """Sends zero commands to wake up the controller."""
-        print("Arming motor...")
+    def arm(self) -> None:
+        """Wake the CubeMars motor by sending ten zero-current commands.
+
+        This satisfies the controller's watchdog requirement so it
+        transitions from idle to active mode.
+        """
         for _ in range(10):
-            self.send_torque(0)
+            self.send_torque(0.0)
             time.sleep(0.01)
 
-    def send_torque(self, current_amps):
+    def send_torque(self, current_amps: float) -> None:
+        """Command a torque-producing current to the motor.
+
+        The current value is scaled to milliamps, packed as a 32-bit
+        big-endian signed integer, and transmitted on the CAN bus.
+
+        Args:
+            current_amps: Desired phase current in amperes.
         """
-        Sets motor torque (Current).
-        Range: -10A to 10A (Safe limits)
-        """
-        # Command 1 = Set Current
-        arb_id = (1 << 8) | self.motor_id
-        
-        # VESC expects milliamps (Int32)
-        current_ma = int(current_amps * 1000.0)
-        data = struct.pack('>i', current_ma)
-        
-        msg = can.Message(arbitration_id=arb_id, data=data, is_extended_id=True)
+        arb_id: int = (1 << 8) | self.motor_id
+        payload: bytes = struct.pack(">i", int(current_amps * 1000.0))
+        msg = can.Message(arbitration_id=arb_id, data=payload, is_extended_id=True)
         try:
             self.bus.send(msg)
         except can.CanError:
-            pass # Skip if buffer full
-
-    def get_state(self):
-        """
-        Returns (Position_Deg, Speed_RPM, Current_A) or None
-        """
-        # Drain buffer to get latest
-        last_msg = None
-        while True:
-            msg = self.bus.recv(timeout=0)
-            if not msg: break
-            
-            cmd = msg.arbitration_id >> 8
-            dev = msg.arbitration_id & 0xFF
-            
-            if cmd == 41 and dev == self.motor_id: # ID 41 = Status
-                last_msg = msg
-        
-        if last_msg:
-            # Parse Data (8 bytes)
-            # Unpack 4 signed 16-bit integers
-            # Mapping based on your can_id_finder.py results:
-            # 0-1: Position, 2-3: Voltage, 4-5: Torque/Current, 6-7: Speed/Temp
-            vals = struct.unpack('>hhhh', last_msg.data)
-            
-            return {
-                'pos': vals[0] * self.POS_SCALE,
-                'voltage': vals[1] * 0.01,      # Assuming 0.01 scale from can_id_finder
-                'torque': vals[2] * self.CUR_SCALE,
-                'speed': vals[3] * 1.0          # Scale unknown, logging raw
-            }
-        return None
-
-    def stop(self):
-        self.send_torque(0)
-        print("Motor Stopped.")
-
-# --- EXAMPLE USAGE ---
-if __name__ == "__main__":
-    motor = MotorDriver(motor_id=104)
-    if motor.connect():
-        motor.arm()
-        
-        # Setup Logging
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"motor_log_{timestamp}.csv"
-        print(f"Logging data to {filename}...")
-        
-        start = time.time()
-        try:
-            with open(filename, 'w', newline='') as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow(['Time', 'Command_Torque', 'Position', 'Actual_Torque', 'Speed', 'Voltage'])
-                
-                while time.time() - start < 5.0:
-                    # Sine Wave Torque (Swing back and forth)
-                    import math
-                    t = time.time() - start
-                    cmd_torque = 1.0 * math.sin(t * 2.0)
-                    
-                    motor.send_torque(cmd_torque)
-                    
-                    state = motor.get_state()
-                    if state:
-                        print(f"Cmd: {cmd_torque:.2f}A | Act: {state['torque']:.2f}A | Pos: {state['pos']:.1f}°", end='\r')
-                        writer.writerow([f"{t:.4f}", f"{cmd_torque:.4f}", 
-                                         f"{state['pos']:.2f}", f"{state['torque']:.2f}", 
-                                         f"{state['speed']:.2f}", f"{state['voltage']:.2f}"])
-                    
-                    time.sleep(0.02)
-        except KeyboardInterrupt:
             pass
-        finally:
-            motor.stop()
+
+    def get_state(self) -> dict | None:
+        """Drain the receive buffer and return the latest motor feedback.
+
+        The OS-level CAN socket may queue multiple frames. This method
+        reads all pending frames and keeps only the most recent one that
+        matches this driver's motor ID with command byte 41 (status
+        report).
+
+        Returns:
+            A dictionary with 'pos' (scaled position) and 'torque'
+            (scaled current) if a valid frame was found, or None if no
+            matching frame was available.
+        """
+        latest: can.Message | None = None
+
+        while True:
+            frame = self.bus.recv(timeout=0)
+            if frame is None:
+                break
+            cmd: int = frame.arbitration_id >> 8
+            dev: int = frame.arbitration_id & 0xFF
+            if cmd == 41 and dev == self.motor_id:
+                latest = frame
+
+        if latest is None:
+            return None
+
+        val = struct.unpack(">hhhh", latest.data)
+        return {
+            "pos": val[0] * self.POS_SCALE,
+            "torque": val[2] * self.CUR_SCALE,
+        }
+
+    def stop(self) -> None:
+        """Send a zero-torque command and shut down the CAN bus.
+
+        Safe to call even if the bus was never opened or has already
+        been shut down.
+        """
+        if self.bus is not None:
+            self.send_torque(0.0)
+            try:
+                self.bus.shutdown()
+            except (can.CanError, OSError):
+                pass
+            self.bus = None
