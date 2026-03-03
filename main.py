@@ -1,10 +1,14 @@
-"""Main control loop orchestrating IMU reading, PD control, and motor output."""
+"""Main control loop with integrated stability monitoring and keyboard input."""
 
 import sys
 import time
+from collections import deque
 
-from imu_sensor import IMUReader
-from motor_driver import MotorDriver
+#from imu_sensor import IMUReader
+from mocks import MockIMUReader as IMUReader      # <--- Aliased mock
+from keyboard_listener import KeyboardListener
+#from motor_driver import MotorDriver
+from mocks import MockMotorDriver as MotorDriver  # <--- Aliased mock
 from pd_controller import PDController
 
 # ── Master state dictionary ──────────────────────────────────────────────────
@@ -22,6 +26,12 @@ State: dict = {
         "Kp": 0.1,
         "Kd": 0.01,
         "max_torque": 3.0,
+    },
+    "Landing_Logic": {
+        "armed": False,
+        "is_stable": False,
+        "stability_timer": 0.0,
+        "ready_signal": False,
     },
 }
 
@@ -57,6 +67,15 @@ ctrl_pitch = PDController(
     Kd=State["Tuning"]["Kd"],
     max_torque=State["Tuning"]["max_torque"],
 )
+
+# ── Keyboard listener ────────────────────────────────────────────────────────
+
+listener = KeyboardListener(State)
+listener.start()
+
+# ── Stability buffer (1 second window at 50 Hz) ─────────────────────────────
+
+error_buffer: deque = deque(maxlen=50)
 
 # ── 50 Hz control loop ──────────────────────────────────────────────────────
 
@@ -96,13 +115,48 @@ try:
             State["Motors"][2]["torque"] = state_pitch["torque"]
             State["Motors"][2]["pos"] = state_pitch["pos"]
 
+        # ── Sliding window stability logic ───────────────────────────
+        pitch_error: float = abs(TARGET_ANGLE - State["IMU"]["pitch"])
+        error_buffer.append(pitch_error)
+
+        landing = State["Landing_Logic"]
+
+        # Gate 1: Arming check
+        if not landing["armed"]:
+            landing["stability_timer"] = 0.0
+            landing["is_stable"] = False
+            landing["ready_signal"] = False
+        else:
+            # Gate 2: Delta check over the sliding window
+            if len(error_buffer) > 0:
+                delta: float = max(error_buffer) - min(error_buffer)
+            else:
+                delta = float("inf")
+
+            if delta < 2.0:
+                landing["stability_timer"] += dt
+                landing["is_stable"] = True
+            else:
+                landing["stability_timer"] = 0.0
+                landing["is_stable"] = False
+
+            # Gate 3: Verdict
+            landing["ready_signal"] = landing["stability_timer"] > 5.0
+
         # ── Terminal status ──────────────────────────────────────────
+        if landing["ready_signal"]:
+            land_status = "[*** LAND ***]"
+        elif landing["armed"]:
+            land_status = f"[ARMED: {landing['stability_timer']:.1f}s]"
+        else:
+            land_status = "[DISARMED]"
+
         elapsed: float = time.perf_counter() - loop_start
         print(
             f"t={loop_count * LOOP_PERIOD:07.2f}s | "
             f"Roll:{State['IMU']['roll']:+7.2f}° cmd:{cmd_roll:+6.3f}A | "
             f"Pitch:{State['IMU']['pitch']:+7.2f}° cmd:{cmd_pitch:+6.3f}A | "
-            f"dt:{dt * 1000:5.1f}ms",
+            f"dt:{dt * 1000:5.1f}ms {land_status}",
             end="\r",
         )
 
@@ -118,6 +172,7 @@ except KeyboardInterrupt:
     print("\n[INFO] Interrupted by operator. Shutting down...")
 
 finally:
+    listener.stop()
     motor_roll.stop()
     motor_pitch.stop()
-    print("[INFO] Motors stopped. CAN bus released.")
+    print("[INFO] Listener stopped. Motors stopped. CAN bus released.")
