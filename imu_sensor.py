@@ -25,6 +25,10 @@ class IMUReader:
         """Initialize the I2C bus, BNO08x sensor, and enable rotation vector reports."""
         self.i2c: busio.I2C = busio.I2C(board.SCL, board.SDA)
         self.imu: BNO08X_I2C = BNO08X_I2C(self.i2c)
+        
+        # CRITICAL FIX: Reset the sensor to clear any previous "hang" states
+        self.imu.soft_reset()
+        
         self.imu.enable_feature(BNO_REPORT_ROTATION_VECTOR)
         self.last_angles: dict = {"roll": 0.0, "pitch": 0.0, "yaw": 0.0}
 
