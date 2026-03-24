@@ -47,10 +47,10 @@ State: dict = {
         # Roll: confirmed stable at Kp=0.20, Kd=0.030 (log shows 0.44 Hz, no oscillation)
         "roll_Kp": 0.20,
         "roll_Kd": 0.030,
-        # Pitch: Kp=0.10 gives ωn=0.50 Hz; Kd=0.060 → ζ=0.94 (near-critical, no oscillation)
-        # Previous Kd=0.025 gave ζ=0.39 (underdamped → growing oscillation at 0.50 Hz)
+        # Pitch: more sensitive axis — Kp=0.20 oscillated at 2.14 Hz; stepped back to 0.10
+        # Kd raised slightly to 0.025 for better damping at the higher Kp
         "pitch_Kp": 0.10,
-        "pitch_Kd": 0.060,
+        "pitch_Kd": 0.025,
         "max_torque": 3.0,
     },
 }
