@@ -1,6 +1,7 @@
 """BNO08x IMU reader with quaternion-to-Euler conversion over I2C."""
 
 import math
+import time
 
 from adafruit_extended_bus import ExtendedI2C
 from adafruit_bno08x import BNO_REPORT_ROTATION_VECTOR
@@ -39,7 +40,16 @@ class IMUReader:
         """Open the I2C bus, bind to the BNO08x, and enable rotation vector."""
         self.i2c: ExtendedI2C = ExtendedI2C(self._bus_num)
         self.imu: BNO08X_I2C = BNO08X_I2C(self.i2c)
-        self.imu.enable_feature(BNO_REPORT_ROTATION_VECTOR)
+        # BNO08x needs up to 5 s after cold power-on before accepting feature
+        # enable commands.  Retry with backoff rather than failing immediately.
+        for attempt in range(10):
+            try:
+                self.imu.enable_feature(BNO_REPORT_ROTATION_VECTOR)
+                break
+            except RuntimeError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.5)
         self._consec_errors = 0
 
     @staticmethod

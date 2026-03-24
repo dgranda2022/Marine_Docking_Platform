@@ -206,6 +206,24 @@ python3 main.py
 
 ---
 
+## Known Issues — Mechanical Slip (Pending Repair)
+
+**Both motors currently have slip in the motor-to-platform connection.** This is the root cause of instability observed during closed-loop testing and must be resolved before any meaningful gain tuning can be done.
+
+**How slip affects each axis differently:**
+
+- **Pitch axis** — Slip causes the platform to lurch unpredictably rather than move smoothly in response to motor commands. This appeared in data collection as 2 Hz oscillation with ±3° amplitude and 23% command saturation (hitting the 3A clamp), but these are symptoms of the mechanical problem, not a tuning issue.
+
+- **Roll axis** — Carries the full weight of the pitch axis in addition to its own load, making slip significantly worse and the effective load much harder to model. Roll will likely need higher gains and possibly a different control strategy (e.g. feedforward gravity compensation) compared to pitch once repaired.
+
+**What needs to happen before tuning:**
+1. Repair the motor-platform connection on both axes to eliminate slip
+2. Re-run data collection on pitch (`python3 main.py`, Ctrl+C after ~45s, inspect `pitch_data.csv`)
+3. Tune pitch gains first (lighter, more consistent load)
+4. Tune roll separately — expect it to need different `Kp`/`Kd` values and possibly a gravity feedforward term given the extra load
+
+---
+
 ## Project Roadmap
 
 ### Phase 1 — Gravity Compensation (Feedforward Term)

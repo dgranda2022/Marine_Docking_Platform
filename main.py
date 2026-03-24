@@ -12,6 +12,7 @@ Usage:
     python3 main.py
 """
 
+import csv
 import sys
 import time
 
@@ -23,8 +24,8 @@ from serial_motor_driver import SerialMotorDriver
 # Change these if your USB-to-UART adapters enumerate differently.
 # Run `ls /dev/ttyUSB*` or check `dmesg | grep ttyUSB` after plugging in.
 
-PORT_ROLL: str = "/dev/ttyUSB1"   # not connected — fails gracefully
-PORT_PITCH: str = "/dev/ttyUSB0"  # confirmed pitch motor
+PORT_ROLL: str = "/dev/ttyUSB1"   # confirmed roll motor (inverted)
+PORT_PITCH: str = "/dev/ttyUSB0"  # confirmed pitch motor (inverted)
 
 # ── Control Parameters ───────────────────────────────────────────────────────
 
@@ -43,8 +44,13 @@ State: dict = {
         2: {"torque": 0.0, "pos": 0.0},
     },
     "Tuning": {
-        "Kp": 0.1,
-        "Kd": 0.01,
+        # Roll: confirmed stable at Kp=0.20, Kd=0.030 (log shows 0.44 Hz, no oscillation)
+        "roll_Kp": 0.20,
+        "roll_Kd": 0.030,
+        # Pitch: more sensitive axis — Kp=0.20 oscillated at 2.14 Hz; stepped back to 0.10
+        # Kd raised slightly to 0.025 for better damping at the higher Kp
+        "pitch_Kp": 0.10,
+        "pitch_Kd": 0.025,
         "max_torque": 3.0,
     },
 }
@@ -76,26 +82,33 @@ if motor_pitch.ser is not None:
 else:
     print(f"[WARN] Pitch motor NOT connected ({PORT_PITCH}) — pitch axis disabled.")
 
-motor_roll.arm()
-motor_pitch.arm()
-print("[INFO] Both motors armed (10× zero-current wake-up sent).")
+if motor_roll.ser is not None:
+    motor_roll.arm()
+if motor_pitch.ser is not None:
+    motor_pitch.arm()
+print("[INFO] Motors armed.")
 
 # ── Controller Instantiation ─────────────────────────────────────────────────
 
 ctrl_roll = PDController(
-    Kp=State["Tuning"]["Kp"],
-    Kd=State["Tuning"]["Kd"],
+    Kp=State["Tuning"]["roll_Kp"],
+    Kd=State["Tuning"]["roll_Kd"],
     max_torque=State["Tuning"]["max_torque"],
 )
 
 ctrl_pitch = PDController(
-    Kp=State["Tuning"]["Kp"],
-    Kd=State["Tuning"]["Kd"],
+    Kp=State["Tuning"]["pitch_Kp"],
+    Kd=State["Tuning"]["pitch_Kd"],
     max_torque=State["Tuning"]["max_torque"],
 )
 
 # ── 50 Hz Control Loop ──────────────────────────────────────────────────────
 
+LOG_FILE = "pitch_data.csv"
+log_fh   = open(LOG_FILE, "w", newline="")
+log_csv  = csv.writer(log_fh)
+log_csv.writerow(["t_s", "roll_deg", "cmd_roll_A", "pitch_deg", "cmd_pitch_A", "dt_ms"])
+print(f"[INFO] Logging pitch data to {LOG_FILE}")
 print(f"[INFO] Entering control loop at {1.0 / LOOP_PERIOD:.0f} Hz. Press Ctrl+C to stop.")
 
 try:
@@ -117,8 +130,10 @@ try:
         cmd_pitch: float = ctrl_pitch.calculate(TARGET_ANGLE, angles["pitch"], dt)
 
         # ── Motor Output ─────────────────────────────────────────────
-        # Sign is negated for pitch: confirmed empirically — positive RPM/current
-        # reduces pitch angle, so the control output must be inverted.
+        # Both motors are inverted: positive current increases the axis angle,
+        # so control output must be negated for both.
+        # Confirmed empirically: USB0 (pitch) +RPM reduces pitch,
+        #                        USB1 (roll)  +RPM increases roll.
         motor_roll.send_torque(cmd_roll)
         motor_pitch.send_torque(-cmd_pitch)
 
@@ -146,6 +161,16 @@ try:
             end="\r",
         )
 
+        # ── CSV Log ──────────────────────────────────────────────────
+        log_csv.writerow([
+            f"{loop_count * LOOP_PERIOD:.3f}",
+            f"{angles['roll']:.4f}",
+            f"{cmd_roll:.4f}",
+            f"{angles['pitch']:.4f}",
+            f"{cmd_pitch:.4f}",
+            f"{dt * 1000:.2f}",
+        ])
+
         loop_count += 1
 
         # ── Rate Limiting ────────────────────────────────────────────
@@ -158,7 +183,7 @@ except KeyboardInterrupt:
     print("\n[INFO] Interrupted by operator. Shutting down...")
 
 finally:
-    # Zero-torque both motors and release serial ports
     motor_roll.stop()
     motor_pitch.stop()
-    print("[INFO] Motors stopped. Serial ports released.")
+    log_fh.close()
+    print(f"[INFO] Motors stopped. Data saved to {LOG_FILE}.")
