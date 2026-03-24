@@ -2,31 +2,45 @@
 
 import math
 
-import board
-import busio
+from adafruit_extended_bus import ExtendedI2C
 from adafruit_bno08x import BNO_REPORT_ROTATION_VECTOR
 from adafruit_bno08x.i2c import BNO08X_I2C
 
 
 class IMUReader:
-    """High-level interface to a BNO08x IMU on the default I2C bus.
+    """High-level interface to a BNO08x IMU on a specific I2C bus.
 
     Provides fused orientation as Euler angles (degrees) with automatic
-    fallback to the last good reading when the I2C bus glitches.
+    fallback to the last good reading when the I2C bus glitches, and
+    automatic re-initialisation if the sensor locks up.
 
     Attributes:
-        i2c: The underlying busio.I2C peripheral instance.
+        i2c: The underlying ExtendedI2C peripheral instance.
         imu: The BNO08X_I2C sensor driver.
         last_angles: Most recent valid Euler angle reading, used as a
             fallback when a read fails due to I2C noise.
     """
 
-    def __init__(self) -> None:
-        """Initialize the I2C bus, BNO08x sensor, and enable rotation vector reports."""
-        self.i2c: busio.I2C = busio.I2C(board.SCL, board.SDA)
+    I2C_BUS: int = 7          # /dev/i2c-7 — confirmed by i2cdetect
+    MAX_CONSEC_ERRORS: int = 5 # reinit after this many consecutive failures
+
+    def __init__(self, i2c_bus: int = I2C_BUS) -> None:
+        """Initialize the I2C bus, BNO08x sensor, and enable rotation vector reports.
+
+        Args:
+            i2c_bus: Linux I2C bus number (default 7, confirmed on this board).
+        """
+        self._bus_num: int = i2c_bus
+        self._consec_errors: int = 0
+        self.last_angles: dict = {"roll": 0.0, "pitch": 0.0, "yaw": 0.0}
+        self._init_sensor()
+
+    def _init_sensor(self) -> None:
+        """Open the I2C bus, bind to the BNO08x, and enable rotation vector."""
+        self.i2c: ExtendedI2C = ExtendedI2C(self._bus_num)
         self.imu: BNO08X_I2C = BNO08X_I2C(self.i2c)
         self.imu.enable_feature(BNO_REPORT_ROTATION_VECTOR)
-        self.last_angles: dict = {"roll": 0.0, "pitch": 0.0, "yaw": 0.0}
+        self._consec_errors = 0
 
     @staticmethod
     def _quaternion_to_euler(
@@ -92,7 +106,14 @@ class IMUReader:
                 "pitch": pitch_deg,
                 "yaw": yaw_deg,
             }
+            self._consec_errors = 0
         except Exception:
+            self._consec_errors += 1
+            if self._consec_errors >= self.MAX_CONSEC_ERRORS:
+                try:
+                    self._init_sensor()
+                except Exception:
+                    pass
             return self.last_angles.copy()
 
         return self.last_angles.copy()

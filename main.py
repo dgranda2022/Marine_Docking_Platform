@@ -4,9 +4,9 @@ Orchestrates IMU reading, PD control, and motor output over VESC serial
 links.  Drop-in replacement for the CAN-based main.py.
 
 Hardware:
-    - IMU:   BNO08x on I2C (unchanged from CAN version)
-    - Roll:  CubeMars AK60-39 V3.0 on /dev/ttyUSB0  (USB-to-UART #1)
-    - Pitch: CubeMars AK60-39 V3.0 on /dev/ttyUSB1  (USB-to-UART #2)
+    - IMU:   BNO08x on I2C bus 7, address 0x4A
+    - Pitch: CubeMars AK60-39 V3.0 on /dev/ttyUSB0  (confirmed)
+    - Roll:  CubeMars AK60-39 V3.0 on /dev/ttyUSB1  (not yet connected)
 
 Usage:
     python3 main.py
@@ -23,8 +23,8 @@ from serial_motor_driver import SerialMotorDriver
 # Change these if your USB-to-UART adapters enumerate differently.
 # Run `ls /dev/ttyUSB*` or check `dmesg | grep ttyUSB` after plugging in.
 
-PORT_ROLL: str = "/dev/ttyUSB0"
-PORT_PITCH: str = "/dev/ttyUSB1"
+PORT_ROLL: str = "/dev/ttyUSB1"   # not connected — fails gracefully
+PORT_PITCH: str = "/dev/ttyUSB0"  # confirmed pitch motor
 
 # ── Control Parameters ───────────────────────────────────────────────────────
 
@@ -59,16 +59,22 @@ motor_pitch = SerialMotorDriver(port=PORT_PITCH, motor_id=2)
 if not motor_roll.connect():
     print(f"[FATAL] Failed to open UART for motor 1 (roll) on {PORT_ROLL}.",
           file=sys.stderr)
-    sys.exit(1)
+    #sys.exit(1)
 
 if not motor_pitch.connect():
     print(f"[FATAL] Failed to open UART for motor 2 (pitch) on {PORT_PITCH}.",
           file=sys.stderr)
     motor_roll.stop()
-    sys.exit(1)
+    #sys.exit(1)
 
-print(f"[INFO] Roll  motor connected on {PORT_ROLL}")
-print(f"[INFO] Pitch motor connected on {PORT_PITCH}")
+if motor_roll.ser is not None:
+    print(f"[INFO] Roll  motor connected on {PORT_ROLL}")
+else:
+    print(f"[WARN] Roll  motor NOT connected ({PORT_ROLL}) — roll axis disabled.")
+if motor_pitch.ser is not None:
+    print(f"[INFO] Pitch motor connected on {PORT_PITCH}")
+else:
+    print(f"[WARN] Pitch motor NOT connected ({PORT_PITCH}) — pitch axis disabled.")
 
 motor_roll.arm()
 motor_pitch.arm()
@@ -111,8 +117,10 @@ try:
         cmd_pitch: float = ctrl_pitch.calculate(TARGET_ANGLE, angles["pitch"], dt)
 
         # ── Motor Output ─────────────────────────────────────────────
+        # Sign is negated for pitch: confirmed empirically — positive RPM/current
+        # reduces pitch angle, so the control output must be inverted.
         motor_roll.send_torque(cmd_roll)
-        motor_pitch.send_torque(cmd_pitch)
+        motor_pitch.send_torque(-cmd_pitch)
 
         # ── Request Telemetry for Next Cycle ─────────────────────────
         motor_roll.request_telemetry()
