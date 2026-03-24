@@ -1,13 +1,37 @@
-"""Main control loop orchestrating IMU reading, PD control, and motor output."""
+"""Main control loop — UART edition.
+
+Orchestrates IMU reading, PD control, and motor output over VESC serial
+links.  Drop-in replacement for the CAN-based main.py.
+
+Hardware:
+    - IMU:   BNO08x on I2C (unchanged from CAN version)
+    - Roll:  CubeMars AK60-39 V3.0 on /dev/ttyUSB0  (USB-to-UART #1)
+    - Pitch: CubeMars AK60-39 V3.0 on /dev/ttyUSB1  (USB-to-UART #2)
+
+Usage:
+    python3 main.py
+"""
 
 import sys
 import time
 
 from imu_sensor import IMUReader
-from motor_driver import MotorDriver
 from pd_controller import PDController
+from serial_motor_driver import SerialMotorDriver
 
-# ── Master state dictionary ──────────────────────────────────────────────────
+# ── Port Configuration ───────────────────────────────────────────────────────
+# Change these if your USB-to-UART adapters enumerate differently.
+# Run `ls /dev/ttyUSB*` or check `dmesg | grep ttyUSB` after plugging in.
+
+PORT_ROLL: str = "/dev/ttyUSB0"
+PORT_PITCH: str = "/dev/ttyUSB1"
+
+# ── Control Parameters ───────────────────────────────────────────────────────
+
+LOOP_PERIOD: float = 0.02     # 50 Hz
+TARGET_ANGLE: float = 0.0     # Level-hold setpoint (degrees)
+
+# ── Master State Dictionary ──────────────────────────────────────────────────
 
 State: dict = {
     "IMU": {
@@ -25,26 +49,32 @@ State: dict = {
     },
 }
 
-# ── Hardware initialisation ──────────────────────────────────────────────────
+# ── Hardware Initialisation ──────────────────────────────────────────────────
 
 imu = IMUReader()
 
-motor_roll = MotorDriver(motor_id=1)
-motor_pitch = MotorDriver(motor_id=2)
+motor_roll = SerialMotorDriver(port=PORT_ROLL, motor_id=1)
+motor_pitch = SerialMotorDriver(port=PORT_PITCH, motor_id=2)
 
 if not motor_roll.connect():
-    print("[FATAL] Failed to open CAN bus for motor 1 (roll).", file=sys.stderr)
+    print(f"[FATAL] Failed to open UART for motor 1 (roll) on {PORT_ROLL}.",
+          file=sys.stderr)
     sys.exit(1)
 
 if not motor_pitch.connect():
-    print("[FATAL] Failed to open CAN bus for motor 2 (pitch).", file=sys.stderr)
+    print(f"[FATAL] Failed to open UART for motor 2 (pitch) on {PORT_PITCH}.",
+          file=sys.stderr)
     motor_roll.stop()
     sys.exit(1)
 
+print(f"[INFO] Roll  motor connected on {PORT_ROLL}")
+print(f"[INFO] Pitch motor connected on {PORT_PITCH}")
+
 motor_roll.arm()
 motor_pitch.arm()
+print("[INFO] Both motors armed (10× zero-current wake-up sent).")
 
-# ── Controller instantiation ─────────────────────────────────────────────────
+# ── Controller Instantiation ─────────────────────────────────────────────────
 
 ctrl_roll = PDController(
     Kp=State["Tuning"]["Kp"],
@@ -58,10 +88,9 @@ ctrl_pitch = PDController(
     max_torque=State["Tuning"]["max_torque"],
 )
 
-# ── 50 Hz control loop ──────────────────────────────────────────────────────
+# ── 50 Hz Control Loop ──────────────────────────────────────────────────────
 
-LOOP_PERIOD: float = 0.02  # 50 Hz
-TARGET_ANGLE: float = 0.0
+print(f"[INFO] Entering control loop at {1.0 / LOOP_PERIOD:.0f} Hz. Press Ctrl+C to stop.")
 
 try:
     prev_time: float = time.perf_counter()
@@ -72,20 +101,24 @@ try:
         dt: float = loop_start - prev_time
         prev_time = loop_start
 
-        # ── IMU read ─────────────────────────────────────────────────
+        # ── IMU Read ─────────────────────────────────────────────────
         angles = imu.get_angles()
         State["IMU"]["roll"] = angles["roll"]
         State["IMU"]["pitch"] = angles["pitch"]
 
-        # ── PD control ───────────────────────────────────────────────
+        # ── PD Control ───────────────────────────────────────────────
         cmd_roll: float = ctrl_roll.calculate(TARGET_ANGLE, angles["roll"], dt)
         cmd_pitch: float = ctrl_pitch.calculate(TARGET_ANGLE, angles["pitch"], dt)
 
-        # ── Motor output ─────────────────────────────────────────────
+        # ── Motor Output ─────────────────────────────────────────────
         motor_roll.send_torque(cmd_roll)
         motor_pitch.send_torque(cmd_pitch)
 
-        # ── Motor feedback ───────────────────────────────────────────
+        # ── Request Telemetry for Next Cycle ─────────────────────────
+        motor_roll.request_telemetry()
+        motor_pitch.request_telemetry()
+
+        # ── Motor Feedback ───────────────────────────────────────────
         state_roll = motor_roll.get_state()
         if state_roll is not None:
             State["Motors"][1]["torque"] = state_roll["torque"]
@@ -96,8 +129,7 @@ try:
             State["Motors"][2]["torque"] = state_pitch["torque"]
             State["Motors"][2]["pos"] = state_pitch["pos"]
 
-        # ── Terminal status ──────────────────────────────────────────
-        elapsed: float = time.perf_counter() - loop_start
+        # ── Terminal Status ──────────────────────────────────────────
         print(
             f"t={loop_count * LOOP_PERIOD:07.2f}s | "
             f"Roll:{State['IMU']['roll']:+7.2f}° cmd:{cmd_roll:+6.3f}A | "
@@ -108,7 +140,7 @@ try:
 
         loop_count += 1
 
-        # ── Rate limiting ────────────────────────────────────────────
+        # ── Rate Limiting ────────────────────────────────────────────
         used: float = time.perf_counter() - loop_start
         sleep_time: float = LOOP_PERIOD - used
         if sleep_time > 0.0:
@@ -118,6 +150,7 @@ except KeyboardInterrupt:
     print("\n[INFO] Interrupted by operator. Shutting down...")
 
 finally:
+    # Zero-torque both motors and release serial ports
     motor_roll.stop()
     motor_pitch.stop()
-    print("[INFO] Motors stopped. CAN bus released.")
+    print("[INFO] Motors stopped. Serial ports released.")
