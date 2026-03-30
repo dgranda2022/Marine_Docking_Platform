@@ -4,9 +4,9 @@ Orchestrates IMU reading, PD control, and motor output over VESC serial
 links.  Drop-in replacement for the CAN-based main.py.
 
 Hardware:
-    - IMU:   BNO08x on I2C bus 7, address 0x4A
-    - Pitch: CubeMars AK60-39 V3.0 on /dev/ttyUSB0  (confirmed)
-    - Roll:  CubeMars AK60-39 V3.0 on /dev/ttyUSB1  (not yet connected)
+    - IMU:   BNO08x on I2C bus 7, address 0x4A  (verification IMU on bus 1, unused)
+    - Pitch: CubeMars AK60-39 V3.0 on /dev/ttyPITCH  (udev: physical port 1-2.1)
+    - Roll:  CubeMars AK60-39 V3.0 on /dev/ttyROLL   (udev: physical port 1-2.2)
 
 Usage:
     python3 main.py
@@ -21,11 +21,12 @@ from pd_controller import PDController
 from serial_motor_driver import SerialMotorDriver
 
 # ── Port Configuration ───────────────────────────────────────────────────────
-# Change these if your USB-to-UART adapters enumerate differently.
-# Run `ls /dev/ttyUSB*` or check `dmesg | grep ttyUSB` after plugging in.
+# Permanent symlinks created by /etc/udev/rules.d/99-marine-platform.rules.
+# Bound to physical USB port locations (not adapter serial numbers) so plug
+# order and reboots do not affect assignment.
 
-PORT_ROLL: str = "/dev/ttyUSB1"   # confirmed roll motor (inverted)
-PORT_PITCH: str = "/dev/ttyUSB0"  # confirmed pitch motor (inverted)
+PORT_PITCH: str = "/dev/ttyPITCH"  # physical port 1-2.1, udev symlink
+PORT_ROLL: str  = "/dev/ttyROLL"   # physical port 1-2.2, udev symlink
 
 # ── Control Parameters ───────────────────────────────────────────────────────
 
